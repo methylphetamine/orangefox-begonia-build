@@ -16,19 +16,19 @@ on:
         required: false
         default: '12.1'
       device_branch:
-        description: 'Device tree branch (unified = dynamic+erofs + FBEv2 decryption / non-dynamic+ext4-f2fs)'
+        description: 'Device tree branch (net-fix has the recovery WiFi + curl/Links2 browser payload)'
         required: false
-        default: 'unified'
+        default: 'net-fix'
       jobs:
-        description: 'Parallel make jobs'
+        description: 'Parallel make jobs (auto-capped to 1 on runners with less than 10 GB of RAM)'
         required: false
-        default: '4'
+        default: '2'
       ccache:
         description: 'Use ccache (true/false)'
         required: false
         default: 'true'
       publish_release:
-        description: 'Create a GitHub release with the image'
+        description: 'Create a GitHub release with the image and flashable ZIP'
         type: boolean
         required: false
         default: false
@@ -43,14 +43,20 @@ env:
   FOX_SYNC_URL: 'https://gitlab.com/OrangeFox/sync.git'
   FOX_SYNC_BRANCH: ${{ github.event.inputs.fox_branch || '12.1' }}
   DEVICE_TREE_URL: 'https://github.com/methylphetamine/device_xiaomi_begonia-orangefox.git'
-  DEVICE_TREE_BRANCH: ${{ github.event.inputs.device_branch || 'unified' }}
+  DEVICE_TREE_BRANCH: ${{ github.event.inputs.device_branch || 'net-fix' }}
+  # Hosted ubuntu-22.04 runners can have as little as ~14 GB free before
+  # cleanup.  The OrangeFox 12.1 checkout is ~34 GB, so every GB counts:
+  # the workflow removes unused runner toolchains before syncing and drops
+  # the .repo object store before compiling.
   SRC_DIR: 'aosp'
-  FOX_BUILD_TYPE: 'Unofficial'
+  FOX_SYNC_DIR: 'fox-sync'
   CCACHE_DIR: '${{ github.workspace }}/.ccache'
+  SWAPFILE: '${{ github.workspace }}/swapfile'
+  FOX_BUILD_TYPE: 'Unofficial'
 
 jobs:
   build:
-    name: Compile OrangeFox recovery.img
+    name: Build OrangeFox recovery image and flashable ZIP
     runs-on: ubuntu-22.04
     timeout-minutes: 350
 
@@ -73,16 +79,44 @@ jobs:
 
       - name: Free disk space
         run: |
+          # The hosted image ships a lot of SDKs/toolchains that an AOSP
+          # recovery build does not need.  Remove them before the 34 GB sync;
+          # GitHub shrank some ubuntu-22.04 runner disks to 73 GB, leaving only
+          # ~14 GB free out of the box.
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                    "$AGENT_TOOLSDIRECTORY/CodeQL" \
-                    "$AGENT_TOOLSDIRECTORY/Python" \
+                    /opt/hostedtoolcache /opt/microsoft /opt/az /opt/google \
+                    /opt/containerd /opt/pipx \
+                    /usr/local/lib/node_modules /usr/local/share/powershell \
+                    /usr/local/swift /usr/local/.ghcup /usr/local/aws-cli /usr/local/aws \
                     /usr/local/share/boost \
-                    /opt/hostedtoolcache/CodeQL || true
+                    /usr/share/swift /usr/share/miniconda /usr/share/az_* \
+                    /usr/share/grafana /usr/share/kibana /usr/share/doc /usr/share/man \
+                    /usr/share/locale /usr/lib/mono /usr/lib/R /usr/lib/postgresql \
+                    /usr/lib/mysql /usr/lib/firefox /usr/lib/chromium \
+                    /var/lib/docker /var/lib/containerd /var/lib/snapd /var/lib/apt/lists \
+                    /var/cache/apt/archives/* \
+                    /home/runner/.cache /home/runner/.npm /home/runner/.dotnet \
+                    /home/runner/.rustup /home/runner/.cargo /home/runner/.ghcup \
+                    /home/runner/.local/lib \
+                    /usr/local/lib/libclang* /usr/lib/llvm* /usr/local/lib/gcc* \
+                    /usr/lib/gcc* /usr/local/lib/go* /usr/lib/go* \
+                    /tmp/* 2>/dev/null || true
+          sudo apt-get clean || true
           df -h /
+          AVAIL=$(df -B1 / | tail -1 | awk '{print $4}')
+          echo "free space after cleanup: $AVAIL bytes"
+          if [ "${AVAIL:-0}" -lt 40000000000 ]; then
+            echo "::error::only $AVAIL bytes free after cleanup; the OrangeFox sync plus build needs at least 40 GB"
+            exit 1
+          fi
+          echo "FREE_SPACE_BYTES=$AVAIL" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
+          # Keep this list at the known-good set: gcc-aarch64-linux-gnu
+          # Conflicts with gcc-multilib, so nothing cross-compiles here any
+          # more (foxkbd ships prebuilt, see tools/FOXKBD.md).
           sudo apt-get install -y --no-install-recommends \
             bc bison ccache curl flex git git-lfs gnupg patch \
             gcc-multilib g++-multilib \
@@ -95,12 +129,12 @@ jobs:
       - name: Set JDK 11
         run: |
           if [ -d "$JAVA_HOME_11_X64" ]; then
-            echo "JAVA_HOME=$JAVA_HOME_11_X64" >> "$GITHUB_ENV"
-            echo "Using preinstalled JDK 11 at $JAVA_HOME_11_X64"
+            export JAVA_HOME="$JAVA_HOME_11_X64"
           else
-            echo "JDK 11 not preinstalled; relying on openjdk-11-jdk-headless"
+            export JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"
           fi
           echo "JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+          echo "Using JDK at $JAVA_HOME"
           "$JAVA_HOME/bin/java" -version 2>&1
 
       - name: Add swap (recovery link steps are memory hungry)
@@ -108,15 +142,66 @@ jobs:
           echo "=== swap before ==="
           swapon --show || true
           free -h
+          nproc
+          # Ubuntu's systemd-oomd kills the whole runner cgroup when memory
+          # pressure crosses its threshold.  AOSP's Kati and link phases can
+          # briefly use most of the RAM; let the kernel OOM killer pick a
+          # compiler instead of taking the runner down with exit 143.
+          sudo systemctl stop systemd-oomd systemd-oomd.socket 2>/dev/null || true
+          sudo systemctl disable systemd-oomd systemd-oomd.socket 2>/dev/null || true
+          sudo systemctl stop earlyoom 2>/dev/null || true
+          echo "oomd: $(systemctl is-active systemd-oomd 2>/dev/null || echo absent)"
           sudo timeout 120 swapoff -a || true
-          sudo rm -f /swapfile
-          sudo fallocate -l 8G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+
+          # Hosted runners vary a lot: some are 4 vCPU / 16 GB with a 146 GB
+          # disk, others are 2 vCPU / 8 GB with a 73 GB disk.  On the small
+          # ones a big *disk* swapfile is counter-productive: it eats the
+          # space out/ needs and, when the build starts paging, the runner VM
+          # goes unresponsive and GitHub drops it with "lost communication"
+          # (exit 143).  Keep only a small disk overflow and use zram (below)
+          # as the real safety net.
+          MEM_GB=$(awk '/MemTotal/{printf "%d", $2/1048576}' /proc/meminfo)
+          AVAIL_GB=$(df -BG / | awk 'NR==2{gsub("G","",$4); print $4}')
+          if [ "$MEM_GB" -lt 12 ]; then
+            SWAP_GB=2
+          else
+            SWAP_GB=4
+          fi
+          if [ "$AVAIL_GB" -lt 40 ]; then SWAP_GB=1; fi
+          echo "ram=${MEM_GB}G disk_free=${AVAIL_GB}G -> disk swap=${SWAP_GB}G"
+
+          sudo rm -f /swapfile "$SWAPFILE"
+          if sudo fallocate -l "${SWAP_GB}G" "$SWAPFILE" \
+              && sudo chmod 600 "$SWAPFILE" \
+              && sudo mkswap "$SWAPFILE" \
+              && sudo swapon --priority 10 "$SWAPFILE"; then
+            echo "swap enabled at $SWAPFILE"
+          else
+            echo "::warning::could not enable swap at $SWAPFILE; continuing without swap"
+            sudo swapoff "$SWAPFILE" 2>/dev/null || true
+            sudo rm -f "$SWAPFILE"
+          fi
+          # Compressed swap in RAM: absorbs the compiler/linker spikes without
+          # touching the runner disk, which is what keeps the agent responsive.
+          if sudo modprobe zram 2>/dev/null && [ -e /dev/zram0 ]; then
+            ZRAM_GB=$(( MEM_GB * 3 / 4 ))
+            if [ "$ZRAM_GB" -gt 8 ]; then ZRAM_GB=8; fi
+            if [ "$ZRAM_GB" -lt 1 ]; then ZRAM_GB=1; fi
+            ZDEV=$(sudo zramctl --find --size "${ZRAM_GB}G" --algorithm lzo-rle 2>/dev/null || true)
+            if [ -n "$ZDEV" ] && sudo mkswap "$ZDEV" >/dev/null 2>&1 \
+                && sudo swapon --priority 100 "$ZDEV"; then
+              echo "zram swap ${ZRAM_GB}G enabled at $ZDEV"
+            fi
+          fi
+          sudo sysctl -w vm.swappiness=100 || true
+          sudo sysctl -w vm.vfs_cache_pressure=50 || true
+          sudo sysctl -w vm.min_free_kbytes=131072 || true
+          # zram is random-access, so skip the readahead multiplier.
+          [ -w /proc/sys/vm/page-cluster ] && sudo sysctl -w vm.page-cluster=0 || true
           echo "=== swap after ==="
           swapon --show
           free -h
+          df -h /
 
       - name: Install repo launcher
         run: |
@@ -139,20 +224,149 @@ jobs:
         if: ${{ (inputs.ccache || 'true') == 'true' }}
         run: |
           mkdir -p "$CCACHE_DIR"
-          ccache -M 8G
+          ccache -M 2G
+          ccache -c || true
           ccache --zero-stats || true
 
       - name: Sync OrangeFox sources
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/fox-sync"
-          git clone --depth=1 "$FOX_SYNC_URL" "$GITHUB_WORKSPACE/fox-sync"
-          cd "$GITHUB_WORKSPACE/fox-sync"
+          mkdir -p "$FOX_SYNC_DIR"
+          # The fox-sync bootstrap clone itself can hit a transient 503.
+          okc=0
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            echo "=== fox-sync bootstrap attempt $attempt ==="
+            rm -rf "$FOX_SYNC_DIR"
+            if git clone --depth=1 "$FOX_SYNC_URL" "$FOX_SYNC_DIR"; then
+              okc=1
+              break
+            fi
+            echo "bootstrap attempt $attempt failed"
+            sleep 90
+          done
+          if [ "$okc" != 1 ]; then
+            echo "::error::fox-sync bootstrap failed after 10 attempts"
+            exit 1
+          fi
+          cd "$FOX_SYNC_DIR"
           chmod +x ./orangefox_sync.sh
-          ./orangefox_sync.sh --branch "$FOX_SYNC_BRANCH" --path "$GITHUB_WORKSPACE/$SRC_DIR"
+          # googlesource occasionally returns 503 for a single project; the
+          # script is resumable, so retry the whole init/sync a few times.
+          ok=0
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            echo "=== OrangeFox sync attempt $attempt ==="
+            if ./orangefox_sync.sh --branch "$FOX_SYNC_BRANCH" --path "$GITHUB_WORKSPACE/$SRC_DIR"; then
+              ok=1
+              break
+            fi
+            echo "sync attempt $attempt failed"
+            sleep 90
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error::OrangeFox source sync failed after 12 attempts"
+            exit 1
+          fi
+          # orangefox_sync.sh requires an absolute --path; return to the
+          # workspace so the relative $SRC_DIR used by later steps resolves.
+          cd "$GITHUB_WORKSPACE"
           echo "--- OrangeFox sources ---"
-          ls -la "$GITHUB_WORKSPACE/$SRC_DIR/bootable/recovery" | head
-          ls -la "$GITHUB_WORKSPACE/$SRC_DIR/vendor/recovery" | head
-          ls -la "$GITHUB_WORKSPACE/$SRC_DIR/vendor/twrp" | head
+          ls -la "$SRC_DIR/bootable/recovery" | head
+          ls -la "$SRC_DIR/vendor/recovery" | head
+          ls -la "$SRC_DIR/vendor/twrp" | head
+          du -sh "$SRC_DIR" "$SRC_DIR/.repo" 2>/dev/null || true
+          df -h /
+
+      - name: Restore wifi_connect page after sync
+        run: |
+          SETTINGS="$SRC_DIR/bootable/recovery/gui/theme/portrait_hdpi/pages/settings.xml"
+          FOX_SETTINGS="/content/foxrecovery/gui/theme/portrait_hdpi/pages/settings.xml"
+          export SETTINGS FOX_SETTINGS
+          python3 -c "
+          import os, re
+          import xml.etree.ElementTree as ET
+          
+          settings = os.environ['SETTINGS']
+          fox_settings = os.environ['FOX_SETTINGS']
+          try:
+              tree = ET.parse(settings)
+              root = tree.getroot()
+              # Check if wifi_connect page already exists
+              if root.find('.//page[@name=\"wifi_connect\"]') is not None:
+                  print('wifi_connect page already present in settings.xml')
+              else:
+                  # Read the page XML from local foxrecovery source
+                  if os.path.exists(fox_settings):
+                      with open(fox_settings, 'r') as f:
+                          content = f.read()
+                      # Extract the wifi_connect page block
+                      match = re.search(r'<page name=\"wifi_connect\".*?</page>', content, re.DOTALL)
+                      if match:
+                          page_block = match.group(0)
+                          # Insert before the last </page> tag
+                          last_close = content.rfind('</page>')
+                          if last_close > 0:
+                              new_content = content[:last_close] + page_block + content[last_close:]
+                              with open(settings, 'w') as f:
+                                  f.write(new_content)
+                              print('Added wifi_connect page to settings.xml')
+                          else:
+                              print('Could not find closing </page> tag, skipping')
+                      else:
+                          print('wifi_connect page not found in foxrecovery source either')
+                  else:
+                      print('foxrecovery source not found at', fox_settings)
+                  print('wifi_connect page restoration complete')
+          except Exception as e:
+              print(f'Error restoring wifi_connect page: {e}')
+              import sys
+              sys.exit(1)
+          "
+
+      - name: Ensure WiFi userspace sources
+        run: |
+          cd "$SRC_DIR"
+          # default.xml lists external/wpa_supplicant_8, but the minimal
+          # manifest includes remove-minimal.xml, which removes that project
+          # ("remove-project name=platform/external/wpa_supplicant_8").  It is
+          # therefore never checked out by repo; clone it at the manifest
+          # revision so recovery can build wpa_supplicant/wpa_cli.
+          if [ ! -f external/wpa_supplicant_8/wpa_supplicant/android.config ]; then
+            echo "external/wpa_supplicant_8 was removed by remove-minimal.xml; cloning it"
+            rm -rf external/wpa_supplicant_8
+            ok=0
+            for attempt in 1 2 3; do
+              if git clone --depth=1 -b android-12.1.0_r4 \
+                  https://android.googlesource.com/platform/external/wpa_supplicant_8 \
+                  external/wpa_supplicant_8; then
+                ok=1
+                break
+              fi
+              echo "wpa_supplicant_8 clone attempt $attempt failed"
+              rm -rf external/wpa_supplicant_8
+              sleep 15
+            done
+            if [ "$ok" != 1 ]; then
+              echo "::error::could not clone external/wpa_supplicant_8"
+              exit 1
+            fi
+          fi
+
+          # These are still in the manifest (remove-minimal.xml does not drop
+          # them), but check explicitly so a future manifest change fails here
+          # with a clear message instead of somewhere deep in the build.
+          for dep in \
+              external/libnl \
+              system/security/keystore \
+              system/security/keystore-engine \
+              system/hardware/interfaces/wifi/keystore/1.0; do
+            if [ ! -e "$dep" ]; then
+              echo "::error::missing WiFi build dependency: $dep"
+              exit 1
+            fi
+          done
+          test -f external/wpa_supplicant_8/wpa_supplicant/android.config
+          echo "--- WiFi sources OK ---"
+          ls -la external/wpa_supplicant_8/wpa_supplicant/android.config
+          ls -d external/libnl system/hardware/interfaces/wifi/keystore/1.0
 
       - name: Clone begonia device tree
         run: |
@@ -161,6 +375,188 @@ jobs:
           test -f "$SRC_DIR/device/xiaomi/begonia/fox_begonia.mk"
           echo "--- device tree ---"
           ls -la "$SRC_DIR/device/xiaomi/begonia"
+
+      - name: Add maintainer credit to recovery
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/patch_maintainer.py" "$SRC_DIR"
+          grep -n '^OF_MAINTAINER' "$SRC_DIR/device/xiaomi/begonia/fox_begonia.mk"
+          grep -n '@methylphetamine' "$SRC_DIR/bootable/recovery/gui/theme/portrait_hdpi/pages/settings.xml"
+          file "$SRC_DIR/bootable/recovery/gui/theme/portrait_hdpi/images/Default/About/maintainer.png"
+
+      - name: Verify on-screen keyboard helper
+        run: |
+          # foxkbd is committed as a prebuilt (tools/FOXKBD.md).  Building it
+          # here needed gcc-aarch64-linux-gnu, which Conflicts with the
+          # gcc-multilib that the host tools need; the dedicated foxkbd
+          # workflow rebuilds it with clang when the source changes.
+          cd "$SRC_DIR/device/xiaomi/begonia"
+          test -x recovery/root/system/bin/foxkbd
+          file recovery/root/system/bin/foxkbd
+          if ! file recovery/root/system/bin/foxkbd | grep -q 'ARM aarch64'; then
+            echo "::error::foxkbd is not an AArch64 binary"
+            exit 1
+          fi
+          if readelf -d recovery/root/system/bin/foxkbd | grep -q NEEDED; then
+            echo "::error::foxkbd is not statically linked"
+            exit 1
+          fi
+          echo "=== foxkbd ==="
+          ls -lh recovery/root/system/bin/foxkbd
+          sha256sum recovery/root/system/bin/foxkbd
+          grep -q '^9b198d9658bab50b1b0f8cce78e74059c4220632d413d8e52383a4c46c263eb6 ' tools/FOXKBD.md \
+            || echo "::warning::foxkbd sha256 changed; update tools/FOXKBD.md"
+
+      - name: Set OrangeFox default theme and status bar
+        run: |
+          THEME_DIR="$SRC_DIR/bootable/recovery/gui/theme/portrait_hdpi/themes"
+          test -f "$THEME_DIR/styles/Dark.xml"
+          # Fresh installs load /twres/themes/style.xml.  Make the Dark style
+          # that file so OrangeFox starts dark without requiring the user to
+          # open the theme workshop first.
+          cp -f "$THEME_DIR/styles/Dark.xml" "$THEME_DIR/style.xml"
+          grep -q 'name="theme_style" value="Dark"' "$THEME_DIR/style.xml"
+
+          # The status font is 40 px but the stock status_info_y is tuned for
+          # the 44 px battery, leaving the clock/status text 8 px high.  Move
+          # only the text down so it is centered in the 80 px status bar; the
+          # battery placement (which uses battery_y) stays unchanged.
+          STATUS="$SRC_DIR/bootable/recovery/gui/theme/portrait_hdpi/pages/templates/statusbar.xml"
+          sed -i 's/y="%status_info_y%"/y="%status_info_y%+8"/g' "$STATUS"
+          test "$(grep -c 'status_info_y%+8' "$STATUS")" -eq 6
+          echo "default theme: $(grep -o 'name="theme_style" value="[^"]*"' "$THEME_DIR/style.xml")"
+          grep -n 'status_info_y%+8' "$STATUS" | head
+
+          # The net-fix device tree keeps the status bar at the top of the
+          # panel (inside the notch area) and carries the MT6360 torch path (torch-light2, the only channel that enables).
+          # Fail early if a stale branch is selected.
+          DEV_MK="$SRC_DIR/device/xiaomi/begonia/fox_begonia.mk"
+          BOARD_MK="$SRC_DIR/device/xiaomi/begonia/BoardConfig.mk"
+          # torch-light0/1 never power the LED in this kernel: their
+          # brightness_set leaves mt6360_enable() commented out, so the channel
+          # is never put into TORCH mode.  Only torch-light2 calls enable().
+          grep -q '^OF_FL_PATH1 := /sys/class/leds/torch-light2$' "$DEV_MK"
+          # OF_FL_PATH2 must stay unset: the two channels disable each other.
+          # Apply the torch-light2 fix by unsetting OF_FL_PATH2 if it's set
+          if grep -q '^OF_FL_PATH2[[:space:]]*:=' "$DEV_MK"; then
+            echo "WARNING: OF_FL_PATH2 is set in device tree, unsetting it for torch-light2 fix"
+            sed -i '/^OF_FL_PATH2[[:space:]]*:=/d' "$DEV_MK"
+            echo "OF_FL_PATH2 has been unset"
+          fi
+          grep -q '^TW_Y_OFFSET := 0$' "$BOARD_MK"
+          grep -q '^TW_H_OFFSET := 0$' "$BOARD_MK"
+
+      - name: Patch wpa_supplicant for recovery
+        run: |
+          WPA_DIR="$SRC_DIR/external/wpa_supplicant_8"
+          CFG="$WPA_DIR/wpa_supplicant/android.config"
+          if [ ! -f "$CFG" ]; then
+            echo "::error::$CFG is missing"
+            ls -la "$WPA_DIR" || true
+            ls -la "$WPA_DIR/wpa_supplicant" || true
+            exit 1
+          fi
+          # Recovery has no HIDL wifi service and no keystore2 daemon, so the
+          # daemon must expose the classic unix control socket for wpa_cli.
+          sed -i 's/^CONFIG_CTRL_IFACE_HIDL=y/#CONFIG_CTRL_IFACE_HIDL=y/' "$CFG"
+          if grep -q '^CONFIG_CTRL_IFACE_HIDL=y' "$CFG"; then
+            echo "::error::failed to disable CONFIG_CTRL_IFACE_HIDL"
+            exit 1
+          fi
+          grep -n 'CONFIG_CTRL_IFACE' "$CFG" | tail -5
+
+          # notify.c includes "hidl.h" and calls wpas_hidl_* unconditionally,
+          # even though AOSP only builds the HIDL implementation when
+          # CONFIG_CTRL_IFACE_HIDL is enabled.  The #else branch in the real
+          # header is incomplete (it has syntax errors and is missing several
+          # notifications), so it cannot be used as-is.  Provide a
+          # recovery-only header in the directory quoted includes search
+          # first; every HIDL notification becomes a no-op.  The daemon then
+          # uses the plain unix control socket, which is what wpa_cli needs.
+          # The real header is still used if HIDL is ever re-enabled.
+          REAL_HIDL="$WPA_DIR/wpa_supplicant/hidl/1.4/hidl.h"
+          STUB_HIDL="$WPA_DIR/wpa_supplicant/hidl.h"
+          test -f "$REAL_HIDL"
+          {
+            echo '/* Generated by the OrangeFox begonia build: HIDL-disabled shim. */'
+            echo '#ifndef WPA_RECOVERY_HIDL_STUB_H'
+            echo '#define WPA_RECOVERY_HIDL_STUB_H'
+            echo '#ifdef CONFIG_CTRL_IFACE_HIDL'
+            echo '#include "hidl/1.4/hidl.h"'
+            echo '#else'
+            echo 'struct wpas_hidl_priv;'
+            echo 'struct wpa_global;'
+            echo '#define wpas_hidl_init(...) ((struct wpas_hidl_priv *)0)'
+            echo '#define wpas_hidl_deinit(...) ((void)0)'
+            # These return int and one call site checks the result.  The
+            # helper keeps a bare statement warning-free under -Wunused-value.
+            echo 'static inline int wpas_hidl_stub_ok(void) { return 0; }'
+            echo '#define wpas_hidl_register_interface(...) wpas_hidl_stub_ok()'
+            echo '#define wpas_hidl_unregister_interface(...) wpas_hidl_stub_ok()'
+            echo '#define wpas_hidl_register_network(...) wpas_hidl_stub_ok()'
+            echo '#define wpas_hidl_unregister_network(...) wpas_hidl_stub_ok()'
+            grep -ho 'wpas_hidl_[a-z0-9_]*' "$REAL_HIDL" \
+              "$WPA_DIR/wpa_supplicant/notify.c" | sort -u |
+              while read -r sym; do
+                case "$sym" in
+                  wpas_hidl_priv|wpas_hidl_init|wpas_hidl_deinit) continue ;;
+                  wpas_hidl_register_interface|wpas_hidl_unregister_interface) continue ;;
+                  wpas_hidl_register_network|wpas_hidl_unregister_network) continue ;;
+                esac
+                printf '#define %s(...) ((void)0)\n' "$sym"
+              done
+            echo '#endif /* CONFIG_CTRL_IFACE_HIDL */'
+            echo '#endif /* WPA_RECOVERY_HIDL_STUB_H */'
+          } > "$STUB_HIDL"
+          test -s "$STUB_HIDL"
+          echo "wrote HIDL shim $STUB_HIDL ($(wc -l < "$STUB_HIDL") lines)"
+          test -f "$SRC_DIR/device/xiaomi/begonia/recovery/root/system/bin/foxwifi"
+          test -f "$SRC_DIR/device/xiaomi/begonia/recovery/root/init.recovery.wifi.rc"
+
+      - name: Patch vold FBE directories for recovery
+        run: |
+          cd "$SRC_DIR"
+          FSCRYPT="system/vold/FsCrypt.cpp"
+          if [ ! -f "$FSCRYPT" ]; then
+            echo "::error::$FSCRYPT is missing; cannot patch FBE key setup"
+            find system -maxdepth 4 -path '*/vold/FsCrypt.cpp' -o -name FsCrypt.cpp || true
+            exit 1
+          fi
+          python3 - "$FSCRYPT" <<'PY'
+          import sys
+
+          path = sys.argv[1]
+          with open(path) as f:
+              src = f.read()
+
+          needle = 'if (!prepare_dir(user_key_dir, 0700, AID_ROOT, AID_ROOT)) return false;'
+          insert = '''// Recovery mounts /data before vold starts, so Android's init has not
+                  // created /data/misc/vold yet.  fs_prepare_dir() only creates the
+                  // final path component; create the parents first, otherwise user_keys
+                  // cannot be created and FBE DE decryption never completes.
+                  if (!prepare_dir("/data/misc", 01771, AID_SYSTEM, AID_MISC)) return false;
+                  if (!prepare_dir("/data/misc/vold", 0700, AID_ROOT, AID_ROOT)) return false;
+                  '''
+
+          if 'prepare_dir("/data/misc/vold"' in src:
+              print('vold FBE parent-directory patch already applied')
+          elif needle in src:
+              src = src.replace(needle, insert + needle, 1)
+              with open(path, 'w') as f:
+                  f.write(src)
+              print('patched', path)
+          else:
+              raise SystemExit('expected fscrypt_init_user0 snippet not found in ' + path)
+          PY
+          grep -n -A6 'Recovery mounts /data before vold starts' "$FSCRYPT"
+
+      - name: Patch vold for dynamic FBE v1/v2 decryption
+        run: |
+          cd "$SRC_DIR"
+          FSCRYPT="system/vold/FsCrypt.cpp"
+          test -f "$FSCRYPT"
+          python3 "$GITHUB_WORKSPACE/scripts/patch_vold_dynamic_fbe.py" "$FSCRYPT"
+          grep -n -A3 'FBE: using installed ROM fstab' "$FSCRYPT"
+          grep -n -A3 'FBE: installed /data policy is v' "$FSCRYPT"
 
       - name: Record OrangeFox source revisions
         run: |
@@ -176,22 +572,33 @@ jobs:
 
       - name: Trim disk before build
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
-          # Drop .git for the largest prebuilt/toolchain trees: they are not
-          # needed to build, and this frees roughly 10 GB.
+          # The checkout is ~34 GB, and some runners only have a 73 GB disk.
+          # Revisions were recorded above, so the repo metadata is not needed
+          # any more: drop the object store and working-tree .git pointers to
+          # leave room for out/.
+          du -sh "$SRC_DIR" "$SRC_DIR/.repo" 2>/dev/null || true
+          rm -rf "$SRC_DIR/.repo"
+          find "$SRC_DIR" -type d -name .git -prune -exec rm -rf {} + 2>/dev/null || true
+          find "$SRC_DIR" -type f -name .git -delete 2>/dev/null || true
           du -sh "$SRC_DIR" 2>/dev/null || true
-          find "$SRC_DIR/prebuilts" -maxdepth 6 -type d -name .git -prune -exec rm -rf {} + 2>/dev/null || true
-          find "$SRC_DIR/.repo/project-objects" -type d -name '*.git' -prune -exec rm -rf {} + 2>/dev/null || true
           df -h /
+          AVAIL=$(df -B1 / | tail -1 | awk '{print $4}')
+          if [ "${AVAIL:-0}" -lt 15000000000 ]; then
+            echo "::error::only $AVAIL bytes free after trimming the source tree; not enough room for out/"
+            exit 1
+          fi
 
       - name: Compile
         env:
           USE_CCACHE: ${{ inputs.ccache || 'true' }}
           ALLOW_MISSING_DEPENDENCIES: 'true'
-          BUILD_JOBS: ${{ inputs.jobs || '4' }}
+          MALLOC_ARENA_MAX: '2'
+          GOGC: '50'
+          GOMAXPROCS: '2'
+          BUILD_JOBS: ${{ inputs.jobs || '2' }}
           MAKEFILE_NAME: ${{ inputs.makefile || 'twrp_begonia-eng' }}
           BUILD_TARGET: ${{ inputs.build_target || 'recoveryimage' }}
-          BUILD_USERNAME: methylphetamine
+          BUILD_USERNAME: A_X
           BUILD_HOSTNAME: poxproject
           FOX_BUILD_DEVICE: begonia
           FOX_BUILD_TYPE: Unofficial
@@ -199,6 +606,27 @@ jobs:
           cd "$SRC_DIR"
           set -o pipefail
           : > build.log
+
+          # Stream memory/PSI state into the job log so a silent runner
+          # shutdown still leaves the last few samples behind.  Every command
+          # in the loop is `|| true`: the step runs under `set -e`/pipefail
+          # and a broken pipe from `head` used to kill the monitor after the
+          # first sample.
+          : > monitor.log
+          ( while :; do
+              echo "=== $(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
+              free -h || true
+              cat /proc/pressure/memory 2>/dev/null || true
+              df -h "$SRC_DIR" / 2>/dev/null || true
+              ps -eo pid,rss,pcpu,comm --sort=-rss 2>/dev/null | sed -n '1,10p' || true
+              swapon --show 2>/dev/null || true
+              dmesg -T 2>/dev/null | tail -n 10 || true
+              sleep 30
+            done ) > monitor.log 2>&1 &
+          MON_PID=$!
+          stdbuf -oL -eL tail -n +1 -f monitor.log &
+          TAIL_PID=$!
+          echo "monitor pid $MON_PID, tail pid $TAIL_PID -> $SRC_DIR/monitor.log"
 
           # OrangeFox's envsetup hook ends with an optional VTS test and
           # returns 1 when frameworks/base/services/core/xsd/vts/Android.mk
@@ -230,14 +658,110 @@ jobs:
           export TARGET_PRODUCT TARGET_BUILD_VARIANT TARGET_BUILD_TYPE
           echo "Using TARGET_PRODUCT=$TARGET_PRODUCT TARGET_BUILD_VARIANT=$TARGET_BUILD_VARIANT"
 
+          # soong_build is Go and happily grows to several GB.  On the small
+          # hosted runners that starves the runner agent and GitHub drops the
+          # job with "lost communication with the server" (exit 143), so give
+          # the Go heap a soft ceiling tied to the real RAM instead of the
+          # fixed 12 GiB that only made sense on the 16 GB runners.
+          MEM_MB=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)
+          GOMEMLIMIT=$(( MEM_MB * 2 / 5 / 1024 ))GiB
+          export GOMEMLIMIT
+          echo "GOMEMLIMIT=$GOMEMLIMIT (MemTotal=${MEM_MB}MB)"
+
+          # One compiler+linker at a time on the 8 GB runners: two parallel
+          # lld links there push the VM into swap thrash and the agent loses
+          # its heartbeat.  The 350 minute job budget absorbs the slower build.
+          if [ "$MEM_MB" -lt 10000 ] && [ "${BUILD_JOBS:-1}" -gt 1 ]; then
+            echo "only ${MEM_MB}MB of RAM: reducing make jobs from $BUILD_JOBS to 1"
+            BUILD_JOBS=1
+          fi
+          echo "mka -j$BUILD_JOBS, $(nproc) vCPU"
+
           mka "$BUILD_TARGET" -j"$BUILD_JOBS" \
-            BUILD_USERNAME=methylphetamine \
+            BUILD_USERNAME="$BUILD_USERNAME" \
             BUILD_HOSTNAME=poxproject 2>&1 | tee -a build.log
+          kill "$MON_PID" "$TAIL_PID" 2>/dev/null || true
 
       - name: Locate and verify output image
         id: image
         run: |
           cd "$SRC_DIR"
+          # Guard against a silent relink skip.  external/wpa_supplicant_8 only
+          # defines its modules when WPA_SUPPLICANT_VERSION=VER_0_8_X, and
+          # relink.sh skips source files that do not exist without failing.
+          for f in \
+              out/target/product/begonia/vendor/bin/hw/wpa_supplicant \
+              out/target/product/begonia/vendor/bin/wpa_cli \
+              out/target/product/begonia/recovery/root/system/bin/wpa_supplicant \
+              out/target/product/begonia/recovery/root/system/bin/wpa_cli \
+              out/target/product/begonia/recovery/root/system/lib64/libkeystore-wifi-hidl.so \
+              out/target/product/begonia/recovery/root/system/lib64/libkeystore-engine-wifi-hidl.so; do
+            if [ ! -e "$f" ]; then
+              echo "::error::missing $f; WiFi userspace was not built or relinked"
+              exit 1
+            fi
+          done
+
+          # Download tools: /system/bin/curl is a wrapper around the static
+          # musl payload, wget/ssl_client are wrappers from the device tree,
+          # and the CA bundle must be packed.
+          ROOT=out/target/product/begonia/recovery/root
+          for f in \
+              "$ROOT/system/bin/curl" \
+              "$ROOT/system/bin/wget" \
+              "$ROOT/system/bin/ssl_client" \
+              "$ROOT/system/bin/foxbrowse" \
+              "$ROOT/system/bin/foxkbd" \
+              "$ROOT/system/etc/foxnet/bin/curl" \
+              "$ROOT/system/etc/foxbrowse/bin/links" \
+              "$ROOT/system/etc/foxbrowse/etc/start.html" \
+              "$ROOT/system/etc/security/cacert.pem"; do
+            if [ ! -e "$f" ]; then
+              echo "::error::missing $f; download/browser payload was not packed"
+              exit 1
+            fi
+          done
+          test -x "$ROOT/system/bin/curl"
+          test -x "$ROOT/system/bin/wget"
+          test -x "$ROOT/system/bin/ssl_client"
+          test -x "$ROOT/system/bin/foxbrowse"
+          test -x "$ROOT/system/bin/foxkbd"
+          grep -q 'foxkbd' "$ROOT/system/bin/foxbrowse"
+          # Files under /system/etc are packed 0644 by fs_config; the wrappers
+          # restore the exec bit at runtime.
+          test -e "$ROOT/system/etc/foxnet/bin/curl"
+          test -e "$ROOT/system/etc/foxbrowse/bin/links"
+
+          echo "=== static curl ==="
+          file "$ROOT/system/etc/foxnet/bin/curl"
+          if readelf -d "$ROOT/system/etc/foxnet/bin/curl" | grep -q NEEDED; then
+            echo "::error::static curl unexpectedly has dynamic dependencies"
+            exit 1
+          fi
+          head -1 "$ROOT/system/bin/curl" | grep -q '^#!/system/bin/sh'
+
+          echo "=== Links2 browser ==="
+          file "$ROOT/system/etc/foxbrowse/bin/links"
+          file "$ROOT/system/bin/foxkbd"
+          if readelf -d "$ROOT/system/bin/foxkbd" | grep -q NEEDED; then
+            echo "::error::foxkbd unexpectedly has dynamic dependencies"
+            exit 1
+          fi
+          if readelf -d "$ROOT/system/etc/foxbrowse/bin/links" | grep -q NEEDED; then
+            echo "::error::Links2 is not statically linked"
+            exit 1
+          fi
+          test -x "$ROOT/system/bin/foxbrowse"
+          test -s "$ROOT/system/etc/foxbrowse/etc/fonts.conf"
+
+          # Verify the build-time theme/status-bar edits actually reached the
+          # packed recovery root, not just the source tree.
+          grep -q 'name="theme_style" value="Dark"' "$ROOT/twres/themes/style.xml"
+          test "$(grep -c 'status_info_y%+8' "$ROOT/twres/pages/templates/statusbar.xml")" -eq 6
+          echo "=== theme/status bar ==="
+          grep -n 'name="theme_style"' "$ROOT/twres/themes/style.xml"
+          grep -n 'status_info_y%+8' "$ROOT/twres/pages/templates/statusbar.xml" | head
+
           echo "=== candidate images ==="
           find out/target/product -maxdepth 2 \
             \( -name 'recovery*.img' -o -name 'OrangeFox*.img' -o -name 'OrangeFox*.zip' \) \
@@ -254,9 +778,84 @@ jobs:
           echo "=== sha256 / size ==="
           sha256sum recovery.img
           ls -la recovery.img
+          SIZE=$(stat -c%s recovery.img)
+          LIMIT=67108864
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+            echo "::error::recovery.img is $SIZE bytes, larger than the ${LIMIT}-byte partition"
+            exit 1
+          fi
+          echo "fits the recovery partition: $SIZE <= $LIMIT bytes"
           echo "=== avb info ==="
           "$SRC_DIR"/out/host/linux-x86/bin/avbtool info_image --image recovery.img || true
           echo "image_path=recovery.img" >> "$GITHUB_OUTPUT"
+
+      - name: Verify official OrangeFox flashable ZIP
+        id: flashable
+        run: |
+          cd "$SRC_DIR"
+          ZIP=$(find out/target/product -maxdepth 2 -type f \
+            -name 'OrangeFox*.zip' ! -name '*_lite.zip' | head -1)
+          if [ -z "$ZIP" ]; then
+            echo "::error::the OrangeFox flashable installer ZIP was not produced"
+            exit 1
+          fi
+          echo "using flashable zip: $ZIP"
+          ZIP_NAME=$(basename "$ZIP")
+          ZIP_PATH="$GITHUB_WORKSPACE/$ZIP_NAME"
+          cp "$ZIP" "$ZIP_PATH"
+          cd "$GITHUB_WORKSPACE"
+          test -s "$ZIP_PATH"
+
+          echo "=== zip integrity ==="
+          unzip -t "$ZIP_PATH"
+          echo "=== zip contents (preview) ==="
+          unzip -l "$ZIP_PATH" | sed -n '1,100p'
+
+          # This must be OrangeFox's installer package, not a bare image zip.
+          for entry in \
+              META-INF/com/google/android/update-binary \
+              META-INF/com/google/android/updater-script \
+              recovery.img; do
+            unzip -Z1 "$ZIP_PATH" | grep -qx "$entry" || {
+              echo "::error::flashable ZIP is missing $entry"
+              exit 1
+            }
+          done
+          # OrangeFox installs its default extras/tools from sdcard/Fox.
+          if ! unzip -Z1 "$ZIP_PATH" | grep -q '^sdcard/Fox/FoxFiles/.'; then
+            echo "::error::flashable ZIP does not contain the default sdcard/Fox/FoxFiles tools"
+            exit 1
+          fi
+          echo "=== default OrangeFox tools (preview) ==="
+          unzip -Z1 "$ZIP_PATH" | grep '^sdcard/Fox/' | sed -n '1,40p'
+
+          # The recovery image inside the installer must be the verified image.
+          rm -f /tmp/ofox-zip-recovery.img
+          unzip -p "$ZIP_PATH" recovery.img > /tmp/ofox-zip-recovery.img
+          cmp recovery.img /tmp/ofox-zip-recovery.img
+          rm -f /tmp/ofox-zip-recovery.img
+
+          # Sanity-check the official installer script, which was patched for
+          # this device by OrangeFox.sh.
+          rm -f /tmp/ofox-update-binary
+          unzip -p "$ZIP_PATH" META-INF/com/google/android/update-binary \
+            > /tmp/ofox-update-binary
+          head -n 5 /tmp/ofox-update-binary
+          grep -q 'TARGET_DEVICE' /tmp/ofox-update-binary || {
+            echo "::error::unexpected OrangeFox installer update-binary"
+            exit 1
+          }
+          rm -f /tmp/ofox-update-binary
+
+          echo "=== zip hash / size ==="
+          sha256sum "$ZIP_PATH"
+          stat -c '%s %n' "$ZIP_PATH"
+          ZIP_SHA=$(sha256sum "$ZIP_PATH" | awk '{print $1}')
+          ZIP_SIZE=$(stat -c%s "$ZIP_PATH")
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "zip_path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
+          echo "zip_sha256=$ZIP_SHA" >> "$GITHUB_OUTPUT"
+          echo "zip_size=$ZIP_SIZE" >> "$GITHUB_OUTPUT"
 
       - name: Upload to Gofile
         id: gofile
@@ -264,56 +863,60 @@ jobs:
         continue-on-error: true
         run: |
           cd "$GITHUB_WORKSPACE"
+          ZIP_NAME="${{ steps.flashable.outputs.zip_name }}"
+          test -f "$ZIP_NAME"
           SRV=$(curl -fsSL https://api.gofile.io/servers | jq -r '.data.servers[0].name // empty')
           if [ -z "$SRV" ]; then
             echo "::warning::Gofile returned no upload server"
             exit 0
           fi
           HTTP=$(curl -sS -o /tmp/gofile.json -w '%{http_code}' \
-            -F "file=@recovery.img" "https://${SRV}.gofile.io/contents/uploadfile" || true)
+            -F "file=@${ZIP_NAME}" "https://${SRV}.gofile.io/contents/uploadfile" || true)
           URL=$(jq -r '.data.downloadPage // empty' /tmp/gofile.json 2>/dev/null || true)
           if [ "$HTTP" != "200" ] || [ -z "$URL" ]; then
             echo "::warning::Gofile upload failed (HTTP ${HTTP:-?})"
             exit 0
           fi
           echo "gofile_url=$URL" >> "$GITHUB_OUTPUT"
-          echo "Gofile: $URL"
+          echo "Gofile: $URL ($ZIP_NAME)"
 
-      - name: Upload to Telegram
+      - name: Upload flashable ZIP to Telegram
         if: success()
         continue-on-error: true
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
           GOFILE_URL: ${{ steps.gofile.outputs.gofile_url }}
+          ZIP_NAME: ${{ steps.flashable.outputs.zip_name }}
+          ZIP_SHA: ${{ steps.flashable.outputs.zip_sha256 }}
+          ZIP_SIZE: ${{ steps.flashable.outputs.zip_size }}
         run: |
           cd "$GITHUB_WORKSPACE"
           if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
             echo "::warning::TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured"
             exit 0
           fi
-          SHA=$(sha256sum recovery.img | awk '{print $1}')
-          SIZE=$(stat -c%s recovery.img)
+          test -f "$ZIP_NAME"
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          CAPTION=$(printf 'OrangeFox recovery - begonia\nSHA256: %s\nGofile: %s\nRun: %s' \
-            "$SHA" "${GOFILE_URL:-n/a}" "$RUN_URL")
+          CAPTION=$(printf 'OrangeFox official installer ZIP - begonia (recovery.img + sdcard/Fox tools)\nBranch: %s\nZIP SHA256: %s\nGofile: %s\nRun: %s' \
+            "${DEVICE_TREE_BRANCH}" "$ZIP_SHA" "${GOFILE_URL:-n/a}" "$RUN_URL")
           API="https://api.telegram.org/bot${TG_TOKEN}"
 
-          if [ "$SIZE" -le 49000000 ]; then
+          if [ "$ZIP_SIZE" -le 49000000 ]; then
             curl -sS -o /tmp/tg.json \
               -F "chat_id=${TG_CHAT}" \
-              -F "document=@recovery.img" \
+              -F "document=@${ZIP_NAME}" \
               --form-string "caption=${CAPTION}" \
               "${API}/sendDocument" || true
             if jq -e '.ok == true' /tmp/tg.json >/dev/null 2>&1; then
-              echo "Telegram: recovery.img sent as a document"
+              echo "Telegram: ${ZIP_NAME} sent as a document"
               exit 0
             fi
             echo "::warning::Telegram sendDocument failed; sending a link instead"
           fi
 
-          TEXT=$(printf 'OrangeFox recovery - begonia\nSHA256: %s\nGofile: %s\nRun: %s\nImage size: %s bytes' \
-            "$SHA" "${GOFILE_URL:-n/a}" "$RUN_URL" "$SIZE")
+          TEXT=$(printf 'OrangeFox official installer ZIP - begonia (recovery.img + sdcard/Fox tools)\nBranch: %s\nZIP SHA256: %s\nGofile: %s\nRun: %s\nZIP size: %s bytes' \
+            "${DEVICE_TREE_BRANCH}" "$ZIP_SHA" "${GOFILE_URL:-n/a}" "$RUN_URL" "$ZIP_SIZE")
           curl -sS -o /tmp/tg.json \
             --data-urlencode "chat_id=${TG_CHAT}" \
             --data-urlencode "text=${TEXT}" \
@@ -367,14 +970,23 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Upload flashable ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: orangefox-begonia-flashable
+          path: ${{ steps.flashable.outputs.zip_name }}
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Upload build log artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
           path: |
-            $SRC_DIR/build.log
-            $SRC_DIR/out/error.log
+            ${{ env.SRC_DIR }}/build.log
+            ${{ env.SRC_DIR }}/monitor.log
+            ${{ env.SRC_DIR }}/out/error.log
           if-no-files-found: ignore
           retention-days: 7
 
@@ -385,14 +997,21 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE"
           SHA=$(sha256sum recovery.img | awk '{print $1}')
+          ZIP_NAME="${{ steps.flashable.outputs.zip_name }}"
+          ZIP_SHA="${{ steps.flashable.outputs.zip_sha256 }}"
+          ZIP_SIZE="${{ steps.flashable.outputs.zip_size }}"
+          test -f "$ZIP_NAME"
           TAG="${GITHUB_REF_NAME:-twrp-begonia-$(date +%Y%m%d%H%M%S)}"
           {
             echo "OrangeFox recovery for Redmi Note 8 Pro (begonia)"
             echo
             echo "- commit: $GITHUB_SHA"
-            echo "- sha256: \`$SHA\`"
+            echo "- recovery.img sha256: \`$SHA\`"
+            echo "- official flashable ZIP (includes default \`sdcard/Fox\` tools): \`$ZIP_NAME\`"
+            echo "- flashable ZIP sha256: \`$ZIP_SHA\`"
+            echo "- flashable ZIP size: $ZIP_SIZE bytes"
             echo "- built by run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           } > release-notes.md
-          gh release create "$TAG" recovery.img --title "OrangeFox begonia $TAG" \
-            --notes-file release-notes.md || \
-          gh release upload "$TAG" recovery.img --clobber
+          gh release create "$TAG" recovery.img "$ZIP_NAME" \
+            --title "OrangeFox begonia $TAG" --notes-file release-notes.md || \
+          gh release upload "$TAG" recovery.img "$ZIP_NAME" --clobber

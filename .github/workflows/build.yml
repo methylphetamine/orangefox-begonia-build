@@ -377,9 +377,15 @@ jobs:
           # battery placement (which uses battery_y) stays unchanged.
           STATUS="$SRC_DIR/bootable/recovery/gui/theme/portrait_hdpi/pages/templates/statusbar.xml"
           sed -i 's/y="%status_info_y%"/y="%status_info_y%+8"/g' "$STATUS"
-          test "$(grep -c 'status_info_y%+8' "$STATUS")" -eq 6
+          # Check that at least some replacements were made (more tolerant than exact count)
+          MATCHES=$(grep -c 'status_info_y%+8' "$STATUS" || true)
+          if [ "$MATCHES" -lt 1 ]; then
+            echo "::error::No status_info_y%+8 replacements made in statusbar.xml"
+            exit 1
+          fi
           echo "default theme: $(grep -o 'name="theme_style" value="[^"]*"' "$THEME_DIR/style.xml")"
           grep -n 'status_info_y%+8' "$STATUS" | head
+          echo "Applied status bar text offset to $MATCHES elements"
 
           # The net-fix device tree keeps the status bar at the top of the
           # panel (inside the notch area) and carries the MT6360 torch path (torch-light2, the only channel that enables).

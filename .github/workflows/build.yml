@@ -395,28 +395,28 @@ jobs:
           # torch-light0/1 never power the LED in this kernel: their
           # brightness_set leaves mt6360_enable() commented out, so the channel
           # is never put into TORCH mode.  Only torch-light2 calls enable().
-          # Apply the torch-light2 fix: set OF_FL_PATH1 to torch-light2 and unset OF_FL_PATH2
+          # Apply the torch-light0 fix: set OF_FL_PATH1 to torch-light0 and unset OF_FL_PATH2
           if grep -q '^OF_FL_PATH1[[:space:]]*:=' "$DEV_MK"; then
             CURRENT_FL1=$(grep '^OF_FL_PATH1[[:space:]]*:=' "$DEV_MK" | sed 's/.*:=[[:space:]]*//')
-            if [ "$CURRENT_FL1" != "/sys/class/leds/torch-light2" ]; then
-              echo "WARNING: OF_FL_PATH1 is set to $CURRENT_FL1, updating to torch-light2 for proper flashlight control"
-              sed -i 's|^OF_FL_PATH1[[:space:]]*:=.*|OF_FL_PATH1 := /sys/class/leds/torch-light2|' "$DEV_MK"
-              echo "OF_FL_PATH1 updated to torch-light2"
+            if [ "$CURRENT_FL1" != "/sys/class/leds/torch-light0" ]; then
+              echo "WARNING: OF_FL_PATH1 is set to $CURRENT_FL1, updating to torch-light0 for proper flashlight control"
+              sed -i 's|^OF_FL_PATH1[[:space:]]*:=.*|OF_FL_PATH1 := /sys/class/leds/torch-light0|' "$DEV_MK"
+              echo "OF_FL_PATH1 updated to torch-light0"
             fi
           else
-            echo "OF_FL_PATH1 not set, adding torch-light2 configuration"
-            echo "OF_FL_PATH1 := /sys/class/leds/torch-light2" >> "$DEV_MK"
+            echo "OF_FL_PATH1 not set, adding torch-light0 configuration"
+            echo "OF_FL_PATH1 := /sys/class/leds/torch-light0" >> "$DEV_MK"
           fi
           # OF_FL_PATH2 must stay unset: the two channels disable each other.
-          # Apply the torch-light2 fix by unsetting OF_FL_PATH2 if it's set
+          # Apply the torch-light0 fix by unsetting OF_FL_PATH2 if it's set
           if grep -q '^OF_FL_PATH2[[:space:]]*:=' "$DEV_MK"; then
-            echo "WARNING: OF_FL_PATH2 is set in device tree, unsetting it for torch-light2 fix"
+            echo "WARNING: OF_FL_PATH2 is set in device tree, unsetting it for torch-light0 fix"
             sed -i '/^OF_FL_PATH2[[:space:]]*:=/d' "$DEV_MK"
             echo "OF_FL_PATH2 has been unset"
           fi
-          # Verify that OF_FL_PATH1 is now set to torch-light2
-          if ! grep -q '^OF_FL_PATH1 := /sys/class/leds/torch-light2$' "$DEV_MK"; then
-            echo "::error::Failed to set OF_FL_PATH1 to torch-light2 in device tree"
+          # Verify that OF_FL_PATH1 is now set to torch-light0
+          if ! grep -q '^OF_FL_PATH1 := /sys/class/leds/torch-light0$' "$DEV_MK"; then
+            echo "::error::Failed to set OF_FL_PATH1 to torch-light0 in device tree"
             exit 1
           fi
           # Verify that OF_FL_PATH2 is now unset
@@ -424,7 +424,7 @@ jobs:
             echo "::error::Failed to unset OF_FL_PATH2 in device tree"
             exit 1
           fi
-          echo "✓ Torch-light2 fix applied: OF_FL_PATH1=torch-light2, OF_FL_PATH2=unset"
+          echo "✓ Torch-light0 fix applied: OF_FL_PATH1=torch-light0, OF_FL_PATH2=unset"
           grep -q '^TW_Y_OFFSET := 0$' "$BOARD_MK"
           grep -q '^TW_H_OFFSET := 0$' "$BOARD_MK"
 

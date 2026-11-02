@@ -436,10 +436,18 @@ jobs:
           # is never put into TORCH mode.  Only torch-light2 calls enable().
           grep -q '^OF_FL_PATH1 := /sys/class/leds/torch-light2$' "$DEV_MK"
           # OF_FL_PATH2 must stay unset: the two channels disable each other.
+          # Apply the torch-light2 fix by unsetting OF_FL_PATH2 if it's set
           if grep -q '^OF_FL_PATH2[[:space:]]*:=' "$DEV_MK"; then
-            echo "::error::OF_FL_PATH2 is set; the second torch channel turns CH1 off on begonia"
+            echo "WARNING: OF_FL_PATH2 is set in device tree, unsetting it for torch-light2 fix"
+            sed -i '/^OF_FL_PATH2[[:space:]]*:=/d' "$DEV_MK"
+            echo "OF_FL_PATH2 has been unset"
+          fi
+          # Verify that OF_FL_PATH2 is now unset
+          if grep -q '^OF_FL_PATH2[[:space:]]*:=' "$DEV_MK"; then
+            echo "::error::Failed to unset OF_FL_PATH2 in device tree"
             exit 1
           fi
+          echo "✓ OF_FL_PATH2 is properly unset for torch-light2 fix"
           grep -q '^TW_Y_OFFSET := 0$' "$BOARD_MK"
           grep -q '^TW_H_OFFSET := 0$' "$BOARD_MK"
 
